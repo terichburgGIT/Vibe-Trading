@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping
@@ -337,20 +338,58 @@ _BAR_MAP = {
 }
 
 
+_MAX_CANDLES_PAGE = 300  # OKX /market/candles hard cap per call
+_MAX_CANDLES_PAGES = 10  # runaway-loop guard; 10 * 300 = 3000 rows max per call
+
+
 def get_historical_bars(
     symbol: str,
     *,
     config: OKXConfig | None = None,
     period: str = "1d",
     limit: int = 90,
+    start: datetime | None = None,
+    end: datetime | None = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Fetch historical OHLCV candlesticks for ``symbol`` (``period`` canonical)."""
+    """Fetch historical OHLCV candlesticks for ``symbol`` (``period`` canonical).
+
+    OKX's ``/market/candles`` endpoint caps a single call at 300 rows. When
+    ``limit`` exceeds that (or ``start`` isn't reached yet), this pages
+    backward using OKX's ``after`` cursor until ``limit``/``start`` is
+    satisfied, upstream data runs out, or ``_MAX_CANDLES_PAGES`` is hit.
+    Every prior single-page call site (``limit`` <= 300, no ``start``/``end``)
+    is unaffected — one call, same as before.
+    """
     cfg = config or load_config()
     market = _market_client(cfg)
     clean = symbol.strip().upper()
     bar = _BAR_MAP.get(period.strip(), "1D")
-    resp = _safe_call(market, "get_candlesticks", instId=clean, bar=bar, limit=str(int(limit)))
+
+    start_ms = int(start.timestamp() * 1000) if start is not None else None
+    after_cursor = str(int(end.timestamp() * 1000)) if end is not None else ""
+
+    rows: list[Any] = []
+    remaining = int(limit)
+    for _ in range(_MAX_CANDLES_PAGES):
+        if remaining <= 0:
+            break
+        page_limit = min(remaining, _MAX_CANDLES_PAGE)
+        resp = _safe_call(
+            market, "get_candlesticks", instId=clean, bar=bar, limit=str(page_limit), after=after_cursor
+        )
+        page = _extract_data(resp)
+        if not page:
+            break
+        rows.extend(page)
+        remaining -= len(page)
+        oldest_ts = int(page[-1][0])
+        if start_ms is not None and oldest_ts <= start_ms:
+            break
+        if len(page) < page_limit:
+            break  # upstream data exhausted
+        after_cursor = str(oldest_ts)
+
     return {
         "status": "ok",
         "profile": cfg.profile,
@@ -359,7 +398,7 @@ def get_historical_bars(
         "symbol": clean,
         "period": period,
         "bar": bar,
-        "bars": [_candle_to_dict(item) for item in _extract_data(resp)],
+        "bars": [_candle_to_dict(item) for item in rows],
     }
 
 

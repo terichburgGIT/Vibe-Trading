@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -426,9 +427,17 @@ def get_historical_bars(
     config: AlpacaConfig | None = None,
     period: str = "1d",
     limit: int = 90,
+    start: datetime | None = None,
+    end: datetime | None = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Fetch historical bars for ``symbol`` (``period`` is a canonical token)."""
+    """Fetch historical bars for ``symbol`` (``period`` is a canonical token).
+
+    ``start``/``end`` are optional UTC bounds. Alpaca's bars endpoint does
+    **not** default to "most recent N bars" when both are omitted — it can
+    return an empty result — so callers that need data should pass ``start``
+    explicitly rather than relying on ``limit`` alone.
+    """
     cfg = config or load_config()
     clean = symbol.strip().upper()
     if tap_forward.tap_enabled():
@@ -436,6 +445,10 @@ def get_historical_bars(
             f"{DATA_HOST}/v2/stocks/{clean}/bars"
             f"?timeframe={_rest_timeframe(period)}&limit={int(limit)}&feed={cfg.feed}"
         )
+        if start is not None:
+            url += f"&start={start.isoformat()}"
+        if end is not None:
+            url += f"&end={end.isoformat()}"
         payload = _read_via_tap(url)
         rows: Any = [_rename_keys(item, _BAR_KEY_ALIASES) for item in _as_iter(_obj_get(payload, "bars") or [])]
     else:
@@ -444,7 +457,14 @@ def get_historical_bars(
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # type: ignore
 
         timeframe = _timeframe(period, TimeFrame, TimeFrameUnit)
-        req = StockBarsRequest(symbol_or_symbols=clean, timeframe=timeframe, limit=int(limit), feed=_data_feed(cfg))
+        req = StockBarsRequest(
+            symbol_or_symbols=clean,
+            timeframe=timeframe,
+            limit=int(limit),
+            feed=_data_feed(cfg),
+            start=start,
+            end=end,
+        )
         bars = client.get_stock_bars(req)
         rows = bars.data.get(clean, []) if hasattr(bars, "data") else _as_iter(bars)
     return {

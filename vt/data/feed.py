@@ -19,7 +19,7 @@ Full contract: `03_Modules.md` § M001. Tests: `vt/tests/test_feed.py`
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 _EQUITY_VENUE = "alpaca"
@@ -66,6 +66,29 @@ class Quote:
 def _venue_for_symbol(symbol: str) -> str:
     """Crypto pairs carry a dash (BTC-USDT); equities are bare tickers (AAPL)."""
     return _CRYPTO_VENUE if "-" in symbol else _EQUITY_VENUE
+
+
+def _default_alpaca_start(timeframe: str, limit: int) -> datetime:
+    """A generous lookback window sized so Alpaca actually returns `limit` bars.
+
+    Alpaca's bars endpoint returns an empty result when `start` is omitted
+    entirely (AD001 exception 1 — confirmed live 2026-09-07) rather than
+    defaulting to "most recent N bars". `limit` counts trading periods, not
+    calendar ones, so this pads well past the raw calendar equivalent to
+    absorb weekends and holidays.
+    """
+    unit = timeframe[-1]
+    try:
+        amount = int(timeframe[:-1])
+    except ValueError:
+        amount = 1
+    if unit == "d":
+        calendar_days = limit * amount * 3  # ~3x pads weekends/holidays
+    elif unit == "h":
+        calendar_days = (limit * amount / 6.5) * 3  # ~6.5 trading hours/day
+    else:  # minutes or an unrecognized unit — pad generously either way
+        calendar_days = (limit * amount / 390) * 3  # ~390 trading minutes/day
+    return datetime.now(timezone.utc) - timedelta(days=max(calendar_days, 7))
 
 
 def _maybe_float(value: Any) -> float | None:
@@ -131,12 +154,17 @@ def get_bars(
         timeframe: Canonical period token (e.g. "1d", "1h") — passed
             through to the connector, which maps it to that venue's own
             timeframe format.
-        start: Optional inclusive UTC lower bound. Applied client-side
-            after fetching `limit` bars — neither connector supports a
-            server-side date-range query today.
-        end: Optional inclusive UTC upper bound, same caveat as `start`.
+        start: Optional inclusive UTC lower bound. Passed through to the
+            connector (both Alpaca and OKX page/paginate against it as of
+            AD001 exceptions 1 and 2), then re-applied client-side as a
+            belt-and-suspenders filter. Alpaca omitting `start` entirely
+            returns zero bars (not "most recent N"), so when the caller
+            doesn't supply one, Alpaca calls compute a generous default
+            (`_default_alpaca_start`) — OKX has no such requirement.
+        end: Optional inclusive UTC upper bound, applied the same way.
         limit: Bars requested from the connector before any start/end
-            filtering.
+            filtering. For OKX, values above 300 trigger multi-page
+            pagination inside the connector (AD001 exception 2).
 
     Returns:
         Bars sorted ascending by time, deduplicated by construction (each
@@ -150,7 +178,8 @@ def get_bars(
     if venue == _EQUITY_VENUE:
         from src.trading.connectors.alpaca import sdk as alpaca_sdk
 
-        raw = alpaca_sdk.get_historical_bars(symbol, period=timeframe, limit=limit)
+        alpaca_start = start if start is not None else _default_alpaca_start(timeframe, limit)
+        raw = alpaca_sdk.get_historical_bars(symbol, period=timeframe, limit=limit, start=alpaca_start, end=end)
         if raw.get("status") != "ok":
             raise DataFeedError(f"alpaca get_historical_bars failed: {raw.get('error')}")
         source_feed = f"alpaca_{alpaca_sdk.load_config().feed}"
@@ -158,7 +187,7 @@ def get_bars(
     else:
         from src.trading.connectors.okx import sdk as okx_sdk
 
-        raw = okx_sdk.get_historical_bars(symbol, period=timeframe, limit=limit)
+        raw = okx_sdk.get_historical_bars(symbol, period=timeframe, limit=limit, start=start, end=end)
         if raw.get("status") != "ok":
             raise DataFeedError(f"okx get_historical_bars failed: {raw.get('error')}")
         source_feed = "okx_demo" if raw.get("is_demo") else "okx_live"
