@@ -1,9 +1,7 @@
-"""M006 -- Risk & Position Sizer. STUB ONLY (Phase C1) -- every function
-below defines its real, final interface and raises NotImplementedError.
-Implementation is Phase C2, not started yet; see `16_Next_Steps.md`
-Phase C. Highest test priority in the project (T010-T014) -- tests are
-written and confirmed failing against this stub *before* any real logic
-lands, per this phase's TDD-mandatory rule.
+"""M006 -- Risk & Position Sizer. Phase C2 implementation (see
+`16_Next_Steps.md` Phase C). T010-T014 in `vt/tests/test_gate.py` were
+written first against a stub, confirmed failing, and drove this
+implementation -- nothing in the tests changed to make them pass.
 
 Enforces `Risk_Policy.md` in full: computes size, places the stop, runs
 the 12-step pre-trade gate, owns the circuit breakers. Net-new, and must
@@ -22,8 +20,10 @@ Full contract in `03_Modules.md` section M006.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -113,7 +113,8 @@ class BreakerState:
 
 def compute_stop(*, side: Literal["long", "short"], entry_price: float, atr: float) -> float:
     """Risk_Policy.md Sec2: initial stop = 1.5 x ATR(14, 5-min) from entry."""
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    offset = STOP_ATR_MULTIPLIER * atr
+    return entry_price - offset if side == "long" else entry_price + offset
 
 
 def compute_size(
@@ -135,7 +136,18 @@ def compute_size(
     stop distance) or equity == 0 -- and must never return a negative
     size or NaN (T010).
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0 or equity <= 0 or calendar_multiplier <= 0:
+        return 0.0
+
+    risk_per_trade = equity * risk_pct * calendar_multiplier
+    size = risk_per_trade / stop_distance
+
+    max_notional = max_position_pct * equity
+    notional = size * entry_price
+    if notional > max_notional:
+        size = max_notional / entry_price
+    return size
 
 
 def validate_stop_change(
@@ -147,7 +159,9 @@ def validate_stop_change(
     `old_stop` (distance measured from `entry_price`). No caller, code
     path, or special case may bypass this (T011).
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    old_distance = abs(entry_price - old_stop)
+    new_distance = abs(entry_price - new_stop)
+    return new_distance <= old_distance + 1e-9
 
 
 def record_trade(state: BreakerState, *, r_multiple: float, equity: float, now: datetime) -> BreakerState:
@@ -155,7 +169,58 @@ def record_trade(state: BreakerState, *, r_multiple: float, equity: float, now: 
     state (never mutates `state` in place, per the project's immutability
     convention). Trips the breakers per Risk_Policy.md Sec3.
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    today = now.date().isoformat()
+    if state.session_date == today:
+        session_r = state.session_r + r_multiple
+        trades_today = state.trades_today + 1
+    else:
+        session_r = r_multiple
+        trades_today = 1
+
+    consecutive_losses = state.consecutive_losses + 1 if r_multiple < 0 else 0
+
+    # Weekly loss limit resets Sec3 'Manual, after a written review' -- once
+    # breached, week_start_date/weekly_r are frozen; they never roll over on
+    # their own, unlike the daily counters above.
+    monday = (now.date() - timedelta(days=now.date().weekday())).isoformat()
+    already_weekly_halted = state.weekly_r <= WEEKLY_LOSS_LIMIT_R
+    if state.week_start_date != monday and not already_weekly_halted:
+        week_start_date, weekly_r = monday, r_multiple
+    else:
+        week_start_date = state.week_start_date or monday
+        weekly_r = state.weekly_r + r_multiple
+
+    # Drawdown kill switch is evaluated as % off the equity high-water mark
+    # (Risk_Policy.md Sec3: '-15R from equity peak') and never auto-clears.
+    # equity_peak == 0.0 means the caller never seeded a starting equity --
+    # tracking stays inert rather than adopting the first post-trade equity
+    # as a false peak (which would flag ordinary losing streaks as a
+    # drawdown-kill event).
+    if state.equity_peak > 0:
+        equity_peak = max(state.equity_peak, equity)
+        drawdown_pct = (equity - equity_peak) / equity_peak * 100
+    else:
+        equity_peak = state.equity_peak
+        drawdown_pct = 0.0
+    hard_killed = state.hard_killed or drawdown_pct <= DRAWDOWN_KILL_R
+
+    halted_until = state.halted_until
+    if consecutive_losses >= CONSECUTIVE_LOSS_HALT:
+        candidate = now + timedelta(hours=24)
+        if halted_until is None or candidate > halted_until:
+            halted_until = candidate
+
+    return BreakerState(
+        session_date=today,
+        session_r=session_r,
+        trades_today=trades_today,
+        consecutive_losses=consecutive_losses,
+        week_start_date=week_start_date,
+        weekly_r=weekly_r,
+        equity_peak=equity_peak,
+        halted_until=halted_until,
+        hard_killed=hard_killed,
+    )
 
 
 def is_halted(state: BreakerState, *, now: datetime) -> bool:
@@ -164,18 +229,33 @@ def is_halted(state: BreakerState, *, now: datetime) -> bool:
     kill from the drawdown breaker never auto-clears -- Risk_Policy.md
     Sec3's 'Manual only' reset).
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    if state.hard_killed:
+        return True
+    if state.weekly_r <= WEEKLY_LOSS_LIMIT_R:
+        return True
+    same_session = state.session_date == now.date().isoformat()
+    if same_session and (state.session_r <= DAILY_LOSS_LIMIT_R or state.trades_today >= DAILY_TRADE_CAP):
+        return True
+    if state.halted_until is not None and now < state.halted_until:
+        return True
+    return False
 
 
 def save_breaker_state(state: BreakerState, path: Path) -> None:
     """Persistence is not optional -- T012 requires breakers to survive a
     process restart.
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    data = dataclasses.asdict(state)
+    data["halted_until"] = state.halted_until.isoformat() if state.halted_until is not None else None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 def load_breaker_state(path: Path) -> BreakerState:
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("halted_until"):
+        data["halted_until"] = datetime.fromisoformat(data["halted_until"])
+    return BreakerState(**data)
 
 
 def evaluate(signal: Signal, *, equity: float, breaker_state: BreakerState, now: datetime) -> Decision:
@@ -187,7 +267,73 @@ def evaluate(signal: Signal, *, equity: float, breaker_state: BreakerState, now:
     A signal whose Trade Card was never journaled is rejected at step 12
     even if every earlier step passed.
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+
+    def rejected(reason: str) -> Decision:
+        return Decision(status="rejected", size=0.0, stop_price=None, reject_reason=reason)
+
+    # Step 1: kill switch -- hard kill, or a live time-boxed halt (e.g. the
+    # consecutive-loss breaker), both mean "stop trading now" regardless of
+    # signal quality.
+    if breaker_state.hard_killed or (breaker_state.halted_until is not None and now < breaker_state.halted_until):
+        return rejected("kill_switch")
+
+    # Step 2: daily/weekly loss limit.
+    if breaker_state.session_r <= DAILY_LOSS_LIMIT_R or breaker_state.weekly_r <= WEEKLY_LOSS_LIMIT_R:
+        return rejected("daily_weekly_loss_limit")
+
+    # Step 3: trade cap.
+    if breaker_state.trades_today >= DAILY_TRADE_CAP:
+        return rejected("trade_cap")
+
+    # Step 4: calendar STAND DOWN.
+    if signal.calendar_multiplier <= 0.0:
+        return rejected("calendar_stand_down")
+
+    # Step 5: max concurrent positions.
+    if signal.open_positions >= MAX_CONCURRENT_POSITIONS:
+        return rejected("max_concurrent_positions")
+
+    # Step 6: sector / correlation cap.
+    if signal.sector_positions >= MAX_SECTOR_POSITIONS:
+        return rejected("sector_correlation_cap")
+
+    # Step 7: quote freshness.
+    if signal.quote_age_seconds >= MAX_QUOTE_AGE_SECONDS:
+        return rejected("quote_freshness")
+
+    # Step 8: broker reconciliation -- a HALT, not a REJECT.
+    if not signal.broker_reconciled:
+        return Decision(status="halted", size=0.0, stop_price=None, reject_reason="broker_reconciliation")
+
+    stop_price = compute_stop(side=signal.side, entry_price=signal.entry_price, atr=signal.atr)
+    size = compute_size(
+        equity=equity,
+        entry_price=signal.entry_price,
+        stop_price=stop_price,
+        calendar_multiplier=signal.calendar_multiplier,
+    )
+
+    # Step 9: computed size within caps.
+    if size <= 0:
+        return rejected("size_within_caps")
+
+    # Step 10: stop distance sane (0.5-5%).
+    stop_distance_pct = abs(signal.entry_price - stop_price) / signal.entry_price
+    if stop_distance_pct < STOP_DISTANCE_MIN_PCT or stop_distance_pct > STOP_DISTANCE_MAX_PCT:
+        return rejected("stop_distance_sane")
+
+    # Step 11: rubric threshold, including the hard per-component floors.
+    if signal.rubric_score < RUBRIC_MIN_SCORE or signal.rubric_r1 < 1 or signal.rubric_r6 < 1:
+        return rejected("rubric_threshold")
+
+    # Step 12: Trade Card written before the position exists.
+    if not signal.card_written:
+        return rejected("trade_card_written")
+
+    return Decision(status="approved", size=size, stop_price=stop_price, reject_reason=None)
+
+
+_DEFAULT_BREAKER_STATE_PATH = Path.home() / ".vibe-trading" / "breaker_state.json"
 
 
 def kill() -> None:
@@ -196,4 +342,9 @@ def kill() -> None:
     T023 / `vt/alerts/kill.py` (Phase C4), which must work even if this
     process itself is wedged.
     """
-    raise NotImplementedError("M006 stub -- Phase C2, see 16_Next_Steps.md")
+    path = _DEFAULT_BREAKER_STATE_PATH
+    try:
+        state = load_breaker_state(path)
+    except FileNotFoundError:
+        state = BreakerState()
+    save_breaker_state(dataclasses.replace(state, hard_killed=True), path)
