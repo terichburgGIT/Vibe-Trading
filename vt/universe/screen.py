@@ -3,10 +3,13 @@
 Daily screen producing <=20 eligible names per venue per
 `Strategy_Spec.md` § 1. Net-new (no upstream equivalent).
 
-Time-of-day-aware RVOL is the core requirement — the baseline is
-volume-by-this-time-of-day over the trailing 20 sessions, never a
-full-day average (that's the classic bug that makes the screen useless
-before noon; T004 exists specifically to catch it).
+Time-of-day-aware RVOL is the core requirement for equities — the
+baseline is volume-by-this-time-of-day over the trailing 20 sessions,
+never a full-day average (that's the classic bug that makes the screen
+useless before noon; T004 exists specifically to catch it). Crypto uses
+a distinct hour-of-week baseline instead (`hour_of_week_rvol`), since it
+trades 24/7 and a pure clock-time baseline would conflate e.g.
+Saturday-3pm volume with Tuesday-3pm volume.
 
 Two layers, deliberately separated:
   - `screen()` is a pure function over `CandidateStats` — no I/O, no
@@ -31,7 +34,7 @@ Full contract: `03_Modules.md` § M002. Tests: `vt/tests/test_screen.py`
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Sequence
 
 from vt.data.feed import Bar
@@ -137,6 +140,49 @@ def time_of_day_rvol(
     return today_volume / baseline
 
 
+def hour_of_week_rvol(
+    today_bars: Sequence[Bar],
+    history_bars: Sequence[Bar],
+    *,
+    asof: datetime,
+    lookback_weeks: int = 4,
+) -> float:
+    """RVOL against the N-week average of volume-in-this-hour-of-week.
+
+    Crypto trades 24/7, so `time_of_day_rvol`'s pure clock-time baseline
+    conflates e.g. Tuesday-15:00 volume with Saturday-15:00 volume, which
+    are structurally different. The baseline here is volume traded in the
+    same (weekday, hour) slot on each of the last `lookback_weeks` prior
+    occurrences of that slot found in `history_bars` — other weekdays in
+    the same hour are excluded, not averaged in.
+
+    `today_bars`/`history_bars` are expected in UTC (M001's AD003 rule);
+    this does not do exchange/local-timezone conversion.
+
+    Raises:
+        ValueError: No prior occurrence of this (weekday, hour) slot exists
+            in `history_bars`, or the computed baseline is zero/negative.
+    """
+    current_hour_start = asof.replace(minute=0, second=0, microsecond=0)
+    today_volume = sum(b.volume for b in today_bars if current_hour_start <= b.time <= asof)
+
+    weekday, hour = asof.weekday(), asof.hour
+    occurrences: dict[date, float] = {}
+    for b in history_bars:
+        if b.time.date() == asof.date() or b.time.weekday() != weekday or b.time.hour != hour:
+            continue
+        occurrences[b.time.date()] = occurrences.get(b.time.date(), 0.0) + b.volume
+
+    if not occurrences:
+        raise ValueError("no history occurrences available to build an hour-of-week RVOL baseline")
+
+    recent = sorted(occurrences.items())[-lookback_weeks:]
+    baseline = sum(v for _, v in recent) / len(recent)
+    if baseline <= 0:
+        raise ValueError("zero/negative hour-of-week RVOL baseline — cannot compute a meaningful ratio")
+    return today_volume / baseline
+
+
 def _passes_equity_filters(stats: CandidateStats) -> bool:
     return (
         stats.time_of_day_rvol >= _EQUITY_MIN_RVOL
@@ -199,13 +245,28 @@ def screen(candidates: Sequence[CandidateStats]) -> list[Candidate]:
     return result
 
 
-def build_universe(symbols: Sequence[str], venue: str, *, asof: datetime, lookback_sessions: int = 20) -> list[Candidate]:
+def build_universe(
+    symbols: Sequence[str],
+    venue: str,
+    *,
+    asof: datetime,
+    lookback_sessions: int = 20,
+    lookback_weeks: int = 4,
+) -> list[Candidate]:
     """Screen a caller-supplied watchlist for `venue`, as of `asof`.
 
     This does NOT discover the watchlist itself — full-market symbol
     scanning (finding which several-thousand tickers to even consider)
     is a separate, larger data-engineering problem not solved here.
     `symbols` is whatever the caller already wants evaluated.
+
+    Equities (Alpaca) use `time_of_day_rvol` over `lookback_sessions`
+    trading days of 1-minute bars. Crypto (OKX) uses `hour_of_week_rvol`
+    over `lookback_weeks` weeks of hourly bars instead — crypto trades
+    24/7, so a pure clock-time baseline would conflate e.g. Saturday-3pm
+    volume with Tuesday-3pm volume (AD001 exception 2 made pulling
+    multi-week hourly history possible at all; OKX caps a single request
+    at 300 bars).
 
     Raises:
         ValueError: `venue` isn't one this module knows how to screen, or
@@ -216,12 +277,22 @@ def build_universe(symbols: Sequence[str], venue: str, *, asof: datetime, lookba
 
     from vt.data import feed as data_feed
 
+    today_start = asof.replace(hour=0, minute=0, second=0, microsecond=0)
+
     stats: list[CandidateStats] = []
     for symbol in symbols:
-        today_bars = data_feed.get_bars(symbol, "1m", start=asof.replace(hour=0, minute=0, second=0, microsecond=0), end=asof)
-        history_bars = data_feed.get_bars(symbol, "1m", end=asof, limit=lookback_sessions * 390)
+        if venue == _EQUITY_VENUE:
+            today_bars = data_feed.get_bars(symbol, "1m", start=today_start, end=asof)
+            history_bars = data_feed.get_bars(symbol, "1m", end=asof, limit=lookback_sessions * 390)
+            rvol = time_of_day_rvol(today_bars, history_bars, asof=asof, lookback_sessions=lookback_sessions)
+        else:
+            today_bars = data_feed.get_bars(symbol, "1h", start=today_start, end=asof)
+            history_start = asof - timedelta(weeks=lookback_weeks + 1)
+            history_bars = data_feed.get_bars(
+                symbol, "1h", start=history_start, end=asof, limit=(lookback_weeks + 1) * 7 * 24
+            )
+            rvol = hour_of_week_rvol(today_bars, history_bars, asof=asof, lookback_weeks=lookback_weeks)
 
-        rvol = time_of_day_rvol(today_bars, history_bars, asof=asof, lookback_sessions=lookback_sessions)
         latest = max(today_bars, key=lambda b: b.time) if today_bars else max(history_bars, key=lambda b: b.time)
         dollar_volume_today = sum(b.volume * b.close for b in today_bars)
 

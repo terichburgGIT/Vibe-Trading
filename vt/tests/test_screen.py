@@ -11,7 +11,7 @@ Run with: pytest vt/tests -m unit
 
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 
@@ -91,6 +91,71 @@ def test_time_of_day_rvol_raises_on_zero_baseline() -> None:
     history_bars = [_bar(date(2026, 9, 8 - i), 11, 0, 100.0) for i in range(1, 4)]  # all after cutoff
     with pytest.raises(ValueError):
         screen.time_of_day_rvol([_bar(today, 9, 30, 100.0)], history_bars, asof=asof)
+
+
+# --------------------------------------------------------------------------- #
+# T004 (crypto sibling) — RVOL must be hour-of-week aware, not just
+# hour-of-day, because crypto trades 24/7 and Saturday-3pm volume is
+# structurally different from Tuesday-3pm volume.
+# --------------------------------------------------------------------------- #
+
+
+def _hourly_bar(dt: datetime, volume: float, close: float = 80_000.0, symbol: str = "BTC-USDT") -> Bar:
+    return Bar(time=dt, open=close, high=close, low=close, close=close, volume=volume, symbol=symbol, source_feed="okx_demo")
+
+
+def test_hour_of_week_rvol_ignores_other_weekdays_in_the_same_hour_slot() -> None:
+    """2026-09-05 is a Saturday. Baseline must average only prior Saturdays
+    at hour 15, never the much-busier Tuesday-15:00 bars mixed into the same
+    `history_bars` set — that's the hour-of-week analogue of T004's trap.
+    """
+    asof = datetime(2026, 9, 5, 15, 30, tzinfo=timezone.utc)  # Saturday, 30m into the 15:00 hour
+    today_bars = [_hourly_bar(datetime(2026, 9, 5, 15, 0, tzinfo=timezone.utc), 300.0)]
+
+    # 4 prior Saturdays at hour 15: ~100 volume each (the real baseline).
+    saturdays = [datetime(2026, 9, 5, tzinfo=timezone.utc) - timedelta(weeks=w) for w in range(1, 5)]
+    history_bars = [_hourly_bar(sat.replace(hour=15), 100.0) for sat in saturdays]
+    # Two Tuesdays at hour 15: ~500 volume each — must NOT dilute the baseline.
+    history_bars += [
+        _hourly_bar(datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc), 500.0),
+        _hourly_bar(datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc), 500.0),
+    ]
+
+    rvol = screen.hour_of_week_rvol(today_bars, history_bars, asof=asof, lookback_weeks=4)
+
+    assert rvol == pytest.approx(3.0, rel=0.01)  # 300 / 100, Tuesdays excluded
+
+
+def test_hour_of_week_rvol_ignores_bars_outside_the_current_hour_slot() -> None:
+    asof = datetime(2026, 9, 5, 15, 30, tzinfo=timezone.utc)
+    today_bars = [
+        _hourly_bar(datetime(2026, 9, 5, 15, 0, tzinfo=timezone.utc), 200.0),
+        _hourly_bar(datetime(2026, 9, 5, 20, 0, tzinfo=timezone.utc), 9_000.0),  # later same day, must not count
+    ]
+    history_bars = [
+        _hourly_bar(datetime(2026, 8, 29, 15, 0, tzinfo=timezone.utc), 100.0),  # prior Saturday
+    ]
+
+    rvol = screen.hour_of_week_rvol(today_bars, history_bars, asof=asof, lookback_weeks=4)
+
+    assert rvol == pytest.approx(2.0, rel=0.01)  # 200 / 100, the 9000 bar excluded
+
+
+def test_hour_of_week_rvol_raises_with_no_matching_occurrences() -> None:
+    asof = datetime(2026, 9, 5, 15, 30, tzinfo=timezone.utc)
+    today_bars = [_hourly_bar(datetime(2026, 9, 5, 15, 0, tzinfo=timezone.utc), 100.0)]
+    # Only Tuesday history — no prior Saturday-15:00 occurrence exists.
+    history_bars = [_hourly_bar(datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc), 500.0)]
+    with pytest.raises(ValueError):
+        screen.hour_of_week_rvol(today_bars, history_bars, asof=asof)
+
+
+def test_hour_of_week_rvol_raises_on_zero_baseline() -> None:
+    asof = datetime(2026, 9, 5, 15, 30, tzinfo=timezone.utc)
+    today_bars = [_hourly_bar(datetime(2026, 9, 5, 15, 0, tzinfo=timezone.utc), 100.0)]
+    history_bars = [_hourly_bar(datetime(2026, 8, 29, 15, 0, tzinfo=timezone.utc), 0.0)]
+    with pytest.raises(ValueError):
+        screen.hour_of_week_rvol(today_bars, history_bars, asof=asof)
 
 
 # --------------------------------------------------------------------------- #
