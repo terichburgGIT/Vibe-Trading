@@ -1,0 +1,40 @@
+# M004 hand-maintained macro-print calendar (Strategy_Spec.md section 2).
+#
+# Each entry is a US market-session date on which the pre-print window is
+# STAND_DOWN (multiplier 0.00). Post-print granularity (STAND_DOWN only
+# until 08:30 ET, then NORMAL) is deliberately not modeled yet -- the whole
+# session is treated as STAND_DOWN, which is the conservative direction.
+#
+# Maintainer note: keep dates in ISO-8601 (YYYY-MM-DD), sorted ascending.
+# Sources: Federal Reserve calendar, BLS release schedule.
+#
+# Coverage window: 2026-09 through 2026-12 (initial seed; extend as needed).
+
+stand_down:
+  # --- FOMC statement/press-conference days (US, ~14:00 ET) ---
+  - date: 2026-09-17
+    event: FOMC
+  - date: 2026-10-29
+    event: FOMC
+  - date: 2026-12-10
+    event: FOMC
+
+  # --- CPI release days (BLS, 08:30 ET) ---
+  - date: 2026-09-11
+    event: CPI
+  - date: 2026-10-15
+    event: CPI
+  - date: 2026-11-13
+    event: CPI
+  - date: 2026-12-10
+    event: CPI
+
+  # --- NFP / Employment Situation (BLS, 08:30 ET, first Friday) ---
+  - date: 2026-09-05
+    event: NFP
+  - date: 2026-10-03
+    event: NFP
+  - date: 2026-11-07
+    event: NFP
+  - date: 2026-12-05
+    event: NFP
