@@ -25,7 +25,10 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:  # pragma: no cover -- type-only, avoids a hard runtime dep
+    from vt.alerts.discord import DiscordAlerter
 
 RISK_PCT = 0.005  # Risk_Policy.md Sec1: 0.50% of current equity, paper phase
 MAX_POSITION_PCT = 0.20  # Sec1: max position value, 20% of equity
@@ -164,10 +167,26 @@ def validate_stop_change(
     return new_distance <= old_distance + 1e-9
 
 
-def record_trade(state: BreakerState, *, r_multiple: float, equity: float, now: datetime) -> BreakerState:
+def record_trade(
+    state: BreakerState,
+    *,
+    r_multiple: float,
+    equity: float,
+    now: datetime,
+    alerter: "DiscordAlerter | None" = None,
+) -> BreakerState:
     """Update breaker state after a closed trade and return a **new**
     state (never mutates `state` in place, per the project's immutability
     convention). Trips the breakers per Risk_Policy.md Sec3.
+
+    `alerter` is optional and construct-and-inject (see `vt/alerts/discord.py`
+    -- never a global). When supplied, fires `alert_breaker_trip` for every
+    breaker that transitions from not-tripped to tripped as a *result of
+    this specific call* -- never re-fires for a breaker that was already
+    tripped coming in (that would spam a message on every subsequent
+    losing trade of an already-halted session). A caller that omits
+    `alerter` gets identical breaker-state behavior to before this
+    parameter existed; the alerting is additive, not load-bearing.
     """
     today = now.date().isoformat()
     if state.session_date == today:
@@ -210,7 +229,7 @@ def record_trade(state: BreakerState, *, r_multiple: float, equity: float, now: 
         if halted_until is None or candidate > halted_until:
             halted_until = candidate
 
-    return BreakerState(
+    new_state = BreakerState(
         session_date=today,
         session_r=session_r,
         trades_today=trades_today,
@@ -221,6 +240,54 @@ def record_trade(state: BreakerState, *, r_multiple: float, equity: float, now: 
         halted_until=halted_until,
         hard_killed=hard_killed,
     )
+
+    if alerter is not None:
+        for breaker, detail in _new_breaker_trips(state, new_state, now=now):
+            alerter.alert_breaker_trip(breaker=breaker, detail=detail)
+
+    return new_state
+
+
+def _new_breaker_trips(
+    old: BreakerState, new: BreakerState, *, now: datetime
+) -> list[tuple[str, str]]:
+    """Breakers that transitioned from not-tripped to tripped going from
+    `old` to `new`. Each breaker's 'was already tripped' check is scoped
+    to the same reset window `new` just entered (same session date for
+    the daily counters; weekly and hard-kill never auto-reset so a
+    simple before/after compare is correct for those). Returns
+    (breaker_name, human-readable detail) pairs in `GATE_STEPS`-ish
+    priority order so a caller iterating them alerts in a sane order.
+    """
+    trips: list[tuple[str, str]] = []
+    same_session = old.session_date == new.session_date
+
+    was_daily = same_session and old.session_r <= DAILY_LOSS_LIMIT_R
+    if new.session_r <= DAILY_LOSS_LIMIT_R and not was_daily:
+        trips.append(("daily_loss_limit", f"session_r={new.session_r:.2f}R (limit {DAILY_LOSS_LIMIT_R}R)"))
+
+    was_weekly = old.weekly_r <= WEEKLY_LOSS_LIMIT_R
+    if new.weekly_r <= WEEKLY_LOSS_LIMIT_R and not was_weekly:
+        trips.append(("weekly_loss_limit", f"weekly_r={new.weekly_r:.2f}R (limit {WEEKLY_LOSS_LIMIT_R}R)"))
+
+    was_cap = same_session and old.trades_today >= DAILY_TRADE_CAP
+    if new.trades_today >= DAILY_TRADE_CAP and not was_cap:
+        trips.append(("trade_cap", f"trades_today={new.trades_today} (cap {DAILY_TRADE_CAP})"))
+
+    was_streak = old.consecutive_losses >= CONSECUTIVE_LOSS_HALT
+    if new.consecutive_losses >= CONSECUTIVE_LOSS_HALT and not was_streak:
+        trips.append(
+            (
+                "consecutive_losses",
+                f"{new.consecutive_losses} losses in a row (halt {CONSECUTIVE_LOSS_HALT}); "
+                f"halted until {new.halted_until.isoformat() if new.halted_until else 'n/a'}",
+            )
+        )
+
+    if new.hard_killed and not old.hard_killed:
+        trips.append(("drawdown_kill_switch", f"equity_peak={new.equity_peak:.2f}, {DRAWDOWN_KILL_R}R breach"))
+
+    return trips
 
 
 def is_halted(state: BreakerState, *, now: datetime) -> bool:
@@ -336,15 +403,25 @@ def evaluate(signal: Signal, *, equity: float, breaker_state: BreakerState, now:
 _DEFAULT_BREAKER_STATE_PATH = Path.home() / ".vibe-trading" / "breaker_state.json"
 
 
-def kill() -> None:
+def kill(*, alerter: "DiscordAlerter | None" = None) -> None:
     """Standalone, reachable without the UI (Risk_Policy.md Sec4) --
     flattens everything and sets a hard-kill breaker state. See also
     T023 / `vt/alerts/kill.py` (Phase C4), which must work even if this
-    process itself is wedged.
+    process itself is wedged (that module has its own independent
+    alerting call site, deliberately not sharing this one -- it must
+    not import from `vt.risk` at all).
+
+    `alerter` is optional; when supplied and this call is the one that
+    actually flips `hard_killed` (i.e. it wasn't already set), fires
+    `alert_breaker_trip`. A manual kill on an already-killed state does
+    not re-alert.
     """
     path = _DEFAULT_BREAKER_STATE_PATH
     try:
         state = load_breaker_state(path)
     except FileNotFoundError:
         state = BreakerState()
+    was_already_killed = state.hard_killed
     save_breaker_state(dataclasses.replace(state, hard_killed=True), path)
+    if alerter is not None and not was_already_killed:
+        alerter.alert_breaker_trip(breaker="manual_kill_switch", detail="vt.risk.gate.kill() invoked")

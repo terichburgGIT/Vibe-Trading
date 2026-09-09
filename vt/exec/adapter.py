@@ -27,7 +27,10 @@ Full contract in `03_Modules.md` section M007.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Literal, Mapping, Protocol, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover -- type-only, avoids a hard runtime dep
+    from vt.alerts.discord import DiscordAlerter
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +259,7 @@ def reconcile(
     internal: Sequence[InternalPosition],
     *,
     quantity_tolerance: float = 1e-9,
+    alerter: "DiscordAlerter | None" = None,
 ) -> ReconcileResult:
     """Compare broker truth to internal state. Any (venue, symbol) where
     quantity differs by more than `quantity_tolerance` -- INCLUDING
@@ -266,6 +270,15 @@ def reconcile(
     `internal` may contain rows from multiple venues; only rows whose
     `venue` matches this adapter's are compared. Drifts are returned in a
     stable order (venue, symbol) so tests and logs stay deterministic.
+
+    `alerter` is optional and construct-and-inject (see
+    `vt/alerts/discord.py`). When supplied and any drift is found, fires
+    `alert_drift` once per drift row (drift is rare enough that one
+    message per symbol is the right amount of noise, not a flood).
+    Every call recomputes the full drift set from scratch, so a caller
+    polling on an interval will re-alert on each poll while the drift
+    persists -- deliberate, since a still-unresolved halt deserves a
+    repeated nudge, not a one-and-done notification that scrolls off.
     """
     broker_rows = list(adapter.positions())
     broker_by_key: dict[tuple[str, str], float] = {
@@ -290,6 +303,15 @@ def reconcile(
                     internal_quantity=i_qty,
                     broker_quantity=b_qty,
                 )
+            )
+
+    if alerter is not None:
+        for drift in drifts:
+            alerter.alert_drift(
+                venue=drift.venue,
+                symbol=drift.symbol,
+                internal_qty=drift.internal_quantity,
+                broker_qty=drift.broker_quantity,
             )
 
     return ReconcileResult(drifts=tuple(drifts), halted=bool(drifts))
