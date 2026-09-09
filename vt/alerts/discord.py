@@ -111,13 +111,23 @@ def _urllib_post(url: str, *, payload: Mapping[str, Any], timeout: float) -> int
     HTTP status code. Raises urllib.error.URLError on transport
     failure; the alerter wraps this in a try/except so callers never
     see the exception.
+
+    Sets an explicit User-Agent. Discord's edge (Cloudflare) returns a
+    bare 403 -- not a webhook-specific error -- for requests carrying
+    urllib's default `Python-urllib/x.y` UA, which is indistinguishable
+    from "the webhook URL is wrong" unless you know to look. Confirmed
+    live against a real webhook (S021): identical request succeeds
+    with 204 once a real UA string is set, fails 403 without one.
     """
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "vt.alerts.discord (VibeTrading paper-trading harness)",
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 -- URL is user-configured
         return resp.status

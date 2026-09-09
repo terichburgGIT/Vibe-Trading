@@ -16,8 +16,10 @@ Run with: pytest vt/tests -m unit
 from __future__ import annotations
 
 import json
+import threading
 import urllib.error
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -297,3 +299,90 @@ def test_default_alerter_survives_missing_credentials_file(tmp_path: Path) -> No
     assert discord.is_configured(alerter.config) is False
     # And its alert() does not raise or POST anywhere.
     assert alerter.alert("test") is False
+
+
+# --------------------------------------------------------------------------- #
+# Real HTTP sink -- regression test for the live 403 found in S021
+# --------------------------------------------------------------------------- #
+#
+# S021: a real webhook POST via _urllib_post returned HTTP 403 against
+# Discord's actual edge. The identical request succeeded (204) once an
+# explicit User-Agent header was set. Discord/Cloudflare rejects
+# urllib's default "Python-urllib/x.y" UA with a bare 403 that is
+# indistinguishable from "the webhook URL itself is wrong" unless you
+# know to check headers. The FakeSink used everywhere else in this file
+# bypasses _urllib_post entirely (it's a duck-typed replacement for the
+# whole HttpSink), so it can never catch a header-shape regression like
+# this -- only a test that runs the real function against a real HTTP
+# server can. A tiny stdlib http.server on localhost is enough; no
+# network egress, no real webhook needed.
+
+
+class _CapturingHandler(BaseHTTPRequestHandler):
+    """Records the last request's headers + body; always answers 204
+    (Discord's real success status for a webhook POST)."""
+
+    captured: dict[str, Any] = {}
+
+    def do_POST(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's naming
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        _CapturingHandler.captured = {
+            "user_agent": self.headers.get("User-Agent"),
+            "content_type": self.headers.get("Content-Type"),
+            "body": json.loads(body) if body else None,
+        }
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 -- stdlib signature
+        pass  # silence BaseHTTPRequestHandler's default stderr access log
+
+
+@pytest.fixture
+def local_http_server():
+    server = HTTPServer(("127.0.0.1", 0), _CapturingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_urllib_post_sets_a_real_user_agent_not_the_urllib_default(local_http_server) -> None:
+    """Regression test for S021's live 403. Discord's edge blocks the
+    default urllib User-Agent; this pins that _urllib_post always sends
+    a real one, against a real HTTP server (not a fake sink), so a
+    future refactor that drops the header is caught here instead of in
+    production against the live webhook."""
+    host, port = local_http_server.server_address
+    url = f"http://{host}:{port}/webhook"
+
+    status = discord._urllib_post(url, payload={"content": "hello"}, timeout=5.0)
+
+    assert status == 204
+    ua = _CapturingHandler.captured["user_agent"]
+    assert ua is not None
+    assert "python-urllib" not in ua.lower(), (
+        f"User-Agent {ua!r} looks like urllib's default -- Discord's edge "
+        "returns a bare 403 for this, indistinguishable from a bad webhook URL"
+    )
+    assert _CapturingHandler.captured["content_type"] == "application/json"
+    assert _CapturingHandler.captured["body"] == {"content": "hello"}
+
+
+def test_alerter_end_to_end_against_real_http_server(local_http_server) -> None:
+    """The full alert() path (not just the sink function) against a
+    real server, confirming DiscordAlerter + _urllib_post compose
+    correctly outside the FakeSink harness used everywhere else."""
+    host, port = local_http_server.server_address
+    url = f"http://{host}:{port}/webhook"
+    alerter = discord.DiscordAlerter(
+        config=discord.DiscordConfig(webhook_url=url, mention_user_id="123456789012345678"),
+        http=discord._urllib_post,
+    )
+
+    assert alerter.alert_breaker_trip(breaker="daily_loss_limit", detail="session_r=-2.1") is True
+    assert "daily_loss_limit" in _CapturingHandler.captured["body"]["content"]
