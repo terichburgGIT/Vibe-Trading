@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VibeTrading — Daily Digest 2026-08-17</title>
+<style>
+:root{
+  --bg:#f6f7f9; --surface:#ffffff; --ink:#161a1d; --muted:#5b6570;
+  --line:#e2e6ea; --green:#137a4b; --amber:#8a5a00; --red:#b3261e;
+  --green-bg:#e7f4ec; --amber-bg:#fbf1dc; --red-bg:#fbe6e5;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#14171a; --surface:#1d2226; --ink:#e8ecef; --muted:#9aa4ad;
+    --line:#2b3238; --green:#5cd39a; --amber:#e0b25a; --red:#f0857c;
+    --green-bg:#12271d; --amber-bg:#2a2313; --red-bg:#2b1614;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.tc-digest{max-width:860px;margin:0 auto;padding:24px 16px 64px}
+h2{font-size:.85rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);
+  margin:32px 0 10px}
+
+/* Gate banner */
+.tc-banner{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding:16px 20px;border-radius:12px;border:2px solid var(--line);margin-bottom:8px}
+.tc-banner-date{font-variant-numeric:tabular-nums;color:var(--muted)}
+.tc-banner-state{font-weight:700;letter-spacing:.04em}
+.tc-banner-detail{color:var(--muted);font-size:.9rem}
+.tc-banner--normal{border-color:var(--green);background:var(--green-bg)}
+.tc-banner--reduced{border-color:var(--amber);background:var(--amber-bg)}
+.tc-banner--stand-down{border-color:var(--red);background:var(--red-bg)}
+
+.tc-standdown{padding:40px 20px;text-align:center;font-size:1.1rem;color:var(--red);
+  border:2px dashed var(--red);border-radius:12px;margin-top:12px;font-weight:600}
+.tc-cards--empty p,.tc-standdown p{margin:0}
+.tc-cards--empty{padding:28px 20px;text-align:center;color:var(--muted)}
+
+/* Card */
+.tc-cards{display:grid;gap:14px;margin-top:8px}
+.tc-card{background:var(--surface);border:1px solid var(--line);border-radius:12px;
+  padding:14px 16px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+.tc-header{display:grid;grid-template-columns:auto 1fr auto;align-items:center;
+  gap:6px 12px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.tc-dir{font-weight:700;letter-spacing:.05em}
+.tc-dir--long{color:var(--green)}
+.tc-dir--short{color:var(--red)}
+.tc-symbol{font-size:1.35rem;font-weight:700}
+.tc-price{color:var(--muted);font-variant-numeric:tabular-nums}
+.tc-score{grid-column:1/-1;display:flex;align-items:center;gap:8px;font-size:.82rem}
+.tc-score-label{color:var(--muted);letter-spacing:.06em}
+.tc-score-num{font-weight:700;font-variant-numeric:tabular-nums}
+.tc-score-bar{display:inline-flex;gap:2px}
+.tc-seg{width:12px;height:10px;border-radius:2px;background:var(--line)}
+.tc-card[data-score-tier=green] .tc-seg--on{background:var(--green)}
+.tc-card[data-score-tier=amber] .tc-seg--on{background:var(--amber)}
+.tc-card[data-score-tier=red] .tc-seg--on{background:var(--red)}
+.tc-score-tier{font-weight:700;letter-spacing:.05em}
+.tc-card[data-score-tier=green] .tc-score-tier{color:var(--green)}
+.tc-card[data-score-tier=amber] .tc-score-tier{color:var(--amber)}
+.tc-card[data-score-tier=red] .tc-score-tier{color:var(--red)}
+.tc-rank{color:var(--muted);font-size:.8rem;text-align:right}
+
+/* Reason chips */
+.tc-reasons{list-style:none;display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;padding:0}
+.tc-chip{background:var(--bg);border:1px solid var(--line);border-radius:999px;
+  padding:4px 12px;font-size:.85rem;font-weight:500}
+
+/* Numbers */
+.tc-numbers{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;margin:12px 0}
+.tc-num{display:flex;justify-content:space-between;gap:12px;
+  font-variant-numeric:tabular-nums;padding:3px 0;border-bottom:1px dotted var(--line)}
+.tc-num-label{color:var(--muted);font-size:.78rem;letter-spacing:.05em}
+.tc-num-value{font-weight:600;text-align:right}
+.tc-num-sub{color:var(--muted);font-weight:400;font-size:.85em}
+.tc-num--stop .tc-num-value{color:var(--red)}
+.tc-num--risk-over .tc-num-value{color:var(--amber);font-weight:700}
+
+/* Invalidation */
+.tc-invalidation{margin:12px 0 4px;padding:10px 12px;background:var(--bg);
+  border-radius:8px;font-size:.9rem}
+.tc-invalid,.tc-timestop{padding:2px 0}
+.tc-invalid-label{color:var(--muted);letter-spacing:.04em;font-size:.78rem}
+
+/* Gate footer + outcome */
+.tc-gate,.tc-outcome{margin-top:10px;padding-top:8px;border-top:1px solid var(--line);
+  font-size:.82rem;color:var(--muted)}
+.tc-gate-label{font-weight:700;letter-spacing:.05em}
+.tc-gate--normal .tc-gate-label{color:var(--green)}
+.tc-gate--reduced .tc-gate-label{color:var(--amber)}
+.tc-gate--stand-down .tc-gate-label{color:var(--red)}
+.tc-outcome{font-weight:600}
+.tc-outcome--win{color:var(--green)}
+.tc-outcome--loss{color:var(--red)}
+
+/* Tables */
+.tc-rej-table,.tc-sc-table{width:100%;border-collapse:collapse;font-size:.85rem}
+.tc-rejected th,.tc-scorecard th{text-align:left;color:var(--muted);
+  font-weight:600;padding:6px 8px;border-bottom:1px solid var(--line)}
+.tc-rejected td,.tc-scorecard td{padding:6px 8px;border-bottom:1px solid var(--line);
+  font-variant-numeric:tabular-nums}
+.tc-verdict{font-weight:700}
+.tc-verdict--pass{color:var(--green)}
+.tc-verdict--fail{color:var(--red)}
+.tc-verdict--insufficient_n{color:var(--muted)}
+.tc-verdict--diagnostic{color:var(--muted);font-weight:500}
+.tc-scorecard--greyed{opacity:.6}
+.tc-sc-warnings{color:var(--amber);font-size:.82rem;margin:8px 0 0;padding-left:18px}
+
+@media print{
+  body{background:#fff}
+  .tc-card{page-break-inside:avoid;box-shadow:none;height:48vh}
+  .tc-digest{max-width:none}
+}
+</style>
+</head>
+<body>
+<main class="tc-digest">
+  <header class="tc-banner tc-banner--stand-down"><div class="tc-banner-date">2026-08-17</div><div class="tc-banner-state">STAND DOWN</div><div class="tc-banner-detail">0.00× size · VIX 31.4 · FOMC 14:00</div></header>
+  <section class="tc-standdown"><p>STAND DOWN — no trades today. Not trading is the decision.</p></section>
+</main>
+</body>
+</html>
