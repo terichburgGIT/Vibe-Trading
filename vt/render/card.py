@@ -525,6 +525,20 @@ def _render_rejected(rejected: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+#: Human-facing verdict labels (T027 -- the dashboard must read honestly at
+#: the exact "good week" moment). The machine token stays on the CSS class
+#: (`tc-verdict--<token>`) so styling and programmatic scraping are unchanged;
+#: only the visible cell text is humanised. Per Metrics_Definitions.md § 3, a
+#: sub-threshold sample renders "n too low", never a green check; session-level
+#: (diagnostic) stats always read "diagnostic — not evidence", never a verdict.
+_VERDICT_LABELS = {
+    "pass": "pass",
+    "fail": "fail",
+    "insufficient_n": "n too low",
+    "diagnostic": "diagnostic — not evidence",
+}
+
+
 def _render_scorecard(sc: Mapping[str, Any] | None) -> str:
     if not sc:
         return ""
@@ -535,6 +549,7 @@ def _render_scorecard(sc: Mapping[str, Any] | None) -> str:
     rows = []
     for line in sc.get("lines") or []:
         verdict = str(line.get("verdict", "diagnostic"))
+        label = _VERDICT_LABELS.get(verdict, verdict)
         bar = line.get("bar")
         bar_txt = "—" if bar is None else f"{float(bar):.2f}"
         rows.append(
@@ -542,9 +557,20 @@ def _render_scorecard(sc: Mapping[str, Any] | None) -> str:
             f'<td class="tc-sc-name">{_esc(line.get("name"))}</td>'
             f'<td class="tc-sc-value">{_esc(_fmt_metric(line.get("value")))}</td>'
             f'<td class="tc-sc-bar">{bar_txt}</td>'
-            f'<td class="tc-verdict tc-verdict--{verdict}">{verdict}</td>'
+            f'<td class="tc-verdict tc-verdict--{verdict}">{_esc(label)}</td>'
             "</tr>"
         )
+
+    # T027 self-deception guard: when the sample is below the verdict
+    # threshold, say so in plain language above the table -- the whole point
+    # is that a good-looking small sample must not read as a green pass.
+    withheld_html = (
+        ""
+        if honest
+        else '<p class="tc-sc-withheld">Sample below the verdict threshold — '
+        "every gated verdict is withheld and shown as “n too low.” "
+        "These numbers are diagnostic, not evidence.</p>"
+    )
 
     warnings = sc.get("warnings") or []
     warn_html = ""
@@ -555,6 +581,7 @@ def _render_scorecard(sc: Mapping[str, Any] | None) -> str:
     return (
         f'  <section class="tc-scorecard{honest_class}">'
         f"<h2>Rolling scorecard (n={_esc(n)})</h2>"
+        f"{withheld_html}"
         '<table class="tc-sc-table">'
         "<thead><tr><th>Metric</th><th>Value</th><th>Bar</th><th>Verdict</th></tr></thead>"
         f'<tbody>{"".join(rows)}</tbody>'
@@ -683,6 +710,7 @@ h2{font-size:.85rem;letter-spacing:.06em;text-transform:uppercase;color:var(--mu
 .tc-verdict--insufficient_n{color:var(--muted)}
 .tc-verdict--diagnostic{color:var(--muted);font-weight:500}
 .tc-scorecard--greyed{opacity:.6}
+.tc-sc-withheld{color:var(--amber);font-weight:600;font-size:.84rem;margin:2px 0 10px}
 .tc-sc-warnings{color:var(--amber);font-size:.82rem;margin:8px 0 0;padding-left:18px}
 
 @media print{
