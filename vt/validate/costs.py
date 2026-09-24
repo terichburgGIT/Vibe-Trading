@@ -9,11 +9,13 @@ module is the one place that presumption is actually enforced: a
 walk-forward run cannot proceed under a `CostModel` whose three
 components are all zero (`ZeroCostBacktestError`).
 
-Two preset `CostModel`s are provided as a documented starting point,
-NOT a validated one -- neither has been checked against real fills yet.
-As of S030, three real OKX fills exist (a manual mechanics test, not a
-strategy signal) that could seed a first real slippage estimate later;
-until then these are literature-standard assumptions, stated as such.
+Two preset `CostModel`s are provided as a documented starting point.
+`CRYPTO_DEFAULT.commission_bps` is now REAL, observed data (S030): three
+real OKX fills -- a manual mechanics test, not a strategy signal --
+each charged exactly 0.35% taker fee, replacing the original 8bps
+literature guess. Its `spread_bps`/`slippage_bps`, and all of
+`EQUITIES_DEFAULT`, remain unvalidated literature-standard assumptions,
+stated as such where each constant is defined below.
 
 Full contract in `03_Modules.md` section M010; test spec in
 `06_Tests.md` T021.
@@ -120,6 +122,12 @@ def apply_costs(*, raw_price: float, side: Literal["buy", "sell"], quantity: flo
 #: and slippage still apply even on liquid names.
 EQUITIES_DEFAULT = CostModel(commission_bps=0.0, spread_bps=1.5, slippage_bps=5.0)
 
-#: OKX spot taker fee is commonly ~8bps; spread + slippage assumed
-#: modestly wider than equities given crypto's thinner order books.
-CRYPTO_DEFAULT = CostModel(commission_bps=8.0, spread_bps=2.0, slippage_bps=5.0)
+#: commission_bps=35.0 is REAL, observed OKX demo-account taker fee data
+#: (S030): three real fills -- BTC-USDT, ETH-USDT, SOL-USDT, all
+#: marketable orders -- each charged exactly 0.35% (feeRate="-0.0035" on
+#: every fill in `get_fills_history`), 4x+ the original 8bps literature
+#: guess this constant shipped with. spread_bps/slippage_bps are still
+#: unvalidated estimates -- three same-minute round trips on a quiet
+#: tape can't isolate spread/slippage from the fee, only the fee itself
+#: was directly observable.
+CRYPTO_DEFAULT = CostModel(commission_bps=35.0, spread_bps=2.0, slippage_bps=5.0)
