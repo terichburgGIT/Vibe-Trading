@@ -185,6 +185,34 @@ def test_get_quote_alpaca_and_okx_normalize_to_the_same_schema(monkeypatch: pyte
         assert q.time.utcoffset() == timedelta(0)
 
 
+def test_get_quote_okx_raises_data_feed_error_on_empty_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A symbol OKX accepts (status=ok) but has no ticker data for must not crash on `q["time"]`.
+
+    Found live (S030): OKX's demo/US host returns `status: "ok"` with an
+    empty `quote: {}` for symbols not actually tradable there (e.g.
+    ARB-USDT), instead of an error payload. The old code indexed
+    `q["time"]` straight through and died with a bare KeyError deep in
+    `build_universe` -- one bad symbol in a watchlist took down the whole
+    pipeline run instead of failing that symbol with a clear reason.
+    """
+    from src.trading.connectors.okx import sdk as okx_sdk
+
+    monkeypatch.setattr(okx_sdk, "get_quote", lambda *a, **k: {"status": "ok", "is_demo": True, "symbol": "ARB-USDT", "quote": {}})
+
+    with pytest.raises(feed.DataFeedError):
+        feed.get_quote("ARB-USDT")
+
+
+def test_get_quote_alpaca_raises_data_feed_error_on_empty_ticker(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.trading.connectors.alpaca import sdk as alpaca_sdk
+
+    monkeypatch.setattr(alpaca_sdk, "get_quote", lambda *a, **k: {"status": "ok", "symbol": "ZZZZ", "quote": {}})
+    monkeypatch.setattr(alpaca_sdk, "load_config", lambda: _alpaca_cfg("iex"))
+
+    with pytest.raises(feed.DataFeedError):
+        feed.get_quote("ZZZZ")
+
+
 # --------------------------------------------------------------------------- #
 # T002 — stale quote detection (Risk_Policy.md: quote > 5s old -> reject)
 # --------------------------------------------------------------------------- #

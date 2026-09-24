@@ -215,6 +215,8 @@ def get_quote(symbol: str) -> Quote:
         if raw.get("status") != "ok":
             raise DataFeedError(f"alpaca get_quote failed: {raw.get('error')}")
         q = raw["quote"]
+        if not q:
+            raise DataFeedError(f"alpaca get_quote returned no ticker data for {symbol!r}")
         return Quote(
             symbol=symbol,
             bid=_maybe_float(q.get("bid")),
@@ -230,6 +232,8 @@ def get_quote(symbol: str) -> Quote:
         if raw.get("status") != "ok":
             raise DataFeedError(f"okx get_quote failed: {raw.get('error')}")
         q = raw["quote"]
+        if not q:
+            raise DataFeedError(f"okx get_quote returned no ticker data for {symbol!r} (not listed on this venue?)")
         return Quote(
             symbol=symbol,
             bid=_maybe_float(q.get("bid")),
