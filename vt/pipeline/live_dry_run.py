@@ -23,10 +23,13 @@ from broker truth is what keeps that from reading as false drift (see
 Usage:
     python -m vt.pipeline.live_dry_run --venue okx
     python -m vt.pipeline.live_dry_run --venue okx --symbols BTC-USDT,ETH-USDT
+    python -m vt.pipeline.live_dry_run --venue alpaca
+    python -m vt.pipeline.live_dry_run --venue alpaca --symbols AAPL,MSFT,NVDA
 
-Equities (`--venue alpaca`) is not wired here yet -- it needs a weekday
-session and hasn't been live-dry-run at all; this module raises clearly
-rather than pretending to support it.
+Equities (`--venue alpaca`) needs a weekday market session to produce a
+meaningful universe screen (RVOL/ATR are computed off real intraday bars);
+outside market hours it will run cleanly but the screen is expected to be
+empty, same as the crypto leg during a quiet session (see S029).
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from vt.risk.gate import BreakerState
 
 _DEFAULT_SYMBOLS = {
     "okx": ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
+    "alpaca": ["AAPL", "MSFT", "NVDA", "AMD", "TSLA"],
 }
 
 
@@ -50,10 +54,11 @@ def _adapter_for(venue: str) -> BrokerExecAdapter:
         from vt.exec.okx import OKXExecAdapter
 
         return OKXExecAdapter()
-    raise NotImplementedError(
-        f"live_dry_run has no wiring for venue={venue!r} yet -- only 'okx' has been "
-        "live-verified (see 13_Session_Log.md). Wiring Alpaca needs a weekday session."
-    )
+    if venue == "alpaca":
+        from vt.exec.alpaca import AlpacaExecAdapter
+
+        return AlpacaExecAdapter()
+    raise NotImplementedError(f"live_dry_run has no wiring for venue={venue!r} yet")
 
 
 def _equity_for(venue: str, adapter: BrokerExecAdapter) -> float:
@@ -64,6 +69,13 @@ def _equity_for(venue: str, adapter: BrokerExecAdapter) -> float:
         if snapshot.get("status") != "ok":
             raise RuntimeError(f"could not read account equity: {snapshot.get('error')}")
         return float(snapshot["account"]["total_equity"])
+    if venue == "alpaca":
+        from src.trading.connectors.alpaca import sdk as alpaca_sdk
+
+        snapshot = alpaca_sdk.get_account_snapshot(alpaca_sdk.load_config())
+        if snapshot.get("status") != "ok":
+            raise RuntimeError(f"could not read account equity: {snapshot.get('error')}")
+        return float(snapshot["account"]["equity"])
     raise NotImplementedError(f"no equity read wired for venue={venue!r}")
 
 
