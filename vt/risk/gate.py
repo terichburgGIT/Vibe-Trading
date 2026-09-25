@@ -325,7 +325,14 @@ def load_breaker_state(path: Path) -> BreakerState:
     return BreakerState(**data)
 
 
-def evaluate(signal: Signal, *, equity: float, breaker_state: BreakerState, now: datetime) -> Decision:
+def evaluate(
+    signal: Signal,
+    *,
+    equity: float,
+    breaker_state: BreakerState,
+    now: datetime,
+    max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS,
+) -> Decision:
     """The 12-step pre-trade gate, Risk_Policy.md Sec5, in the exact
     documented order (`GATE_STEPS`). First failure short-circuits (T013)
     -- later steps are never evaluated once an earlier one fails. Step 8
@@ -333,6 +340,11 @@ def evaluate(signal: Signal, *, equity: float, breaker_state: BreakerState, now:
     -- a state-drift halt is a different severity than an ordinary reject.
     A signal whose Trade Card was never journaled is rejected at step 12
     even if every earlier step passed.
+
+    `max_concurrent_positions` defaults to the Risk_Policy.md Sec1 value
+    (equities' correlation reasoning) but can be overridden per caller --
+    e.g. a crypto-only venue running a wider cap than equities without
+    changing the equities default.
     """
 
     def rejected(reason: str) -> Decision:
@@ -357,7 +369,7 @@ def evaluate(signal: Signal, *, equity: float, breaker_state: BreakerState, now:
         return rejected("calendar_stand_down")
 
     # Step 5: max concurrent positions.
-    if signal.open_positions >= MAX_CONCURRENT_POSITIONS:
+    if signal.open_positions >= max_concurrent_positions:
         return rejected("max_concurrent_positions")
 
     # Step 6: sector / correlation cap.

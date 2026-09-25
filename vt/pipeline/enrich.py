@@ -19,7 +19,9 @@ Sec5 item 1).
   * Derives the R5 structural facts from those same bars: the prior
     session's close from daily bars, the opening-range high/low from the
     first `opening_range_minutes` of the current session, and a
-    deterministic broke-and-held-on-retest heuristic.
+    deterministic broke-and-held-on-retest read -- confirmed against
+    1-minute bars when available (S031, see `_retest_confirmation`),
+    falling back to a bar-level proxy on the 5-min series otherwise.
   * Computes R6 relative strength as the symbol's trailing-`rs_window`
     return minus the benchmark's (SPY for equities, BTC-USDT for crypto),
     fetched through the same feed.
@@ -42,6 +44,24 @@ Design choices worth stating:
     tolerates; it is answering "is price *now* above session VWAP." Entry
     at the *retest* level (Strategy_Spec.md Sec4) is a later refinement;
     the first dry-run prices entry at the current quote.
+
+  * **Retest confirmation reads 1-minute bars, not just the primary 5-min
+    series (S031, AD016).** The rest of the rubric (R1-R4, R6) stays on
+    the pipeline's 5-min series per Strategy_Spec.md -- only R5's
+    break-and-hold-on-retest read gets a second, finer-grained data pull.
+    Reason: a genuine retest-then-hold pattern can happen entirely inside
+    one 5-min candle, and a single bar's OHLC can't distinguish "dipped
+    into the retest zone and held" from "never actually retested" or
+    "retested and failed" -- all three collapse to the same high/low/
+    close. 1-minute bars resolve that ambiguity directly, at the same
+    resolution Strategy_Spec.md Sec4's Entry rule already describes
+    ("limit order at the retest of the breakout level"). This does not
+    add a new rubric component or change R5's 0/1/2 weight -- it only
+    makes the existing "held_on_retest" input more accurate. When 1-min
+    bars aren't available for a symbol (empty result, or `DataFeedError`),
+    `_retest_confirmation` falls back to the original 5-min bar-level
+    proxy rather than failing the whole enrichment -- see that function's
+    docstring.
 
   * **Long-only.** Strategy_Spec.md Sec3 Direction: the paper phase is
     long-only. `side` is always "long". Shorts add four failure modes
@@ -73,7 +93,7 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
-from vt.data.feed import Bar, Quote
+from vt.data.feed import Bar, DataFeedError, Quote
 from vt.indicators.engine import IndicatorFrame
 from vt.pipeline.runner import Enrichment, EnrichmentFn, FeedProtocol
 from vt.universe.screen import Candidate as UniverseCandidate
@@ -96,6 +116,14 @@ DEFAULT_SLOPE_LOOKBACK_BARS = 3
 # as a retest touch. 0.1% is a first-cut; the retest read is the field
 # most likely to want tick-level data later (see module docstring).
 DEFAULT_RETEST_TOLERANCE_PCT = 0.001
+
+# Enough 1-minute bars to cover a full UTC calendar day (matching
+# `_session_bars`' UTC-day session boundary) regardless of what time of
+# day `ref_time` falls at, plus padding -- see `_retest_confirmation`.
+# Only the retest read pays this extra fetch; everything else in this
+# module still runs off the primary bar series the pipeline already
+# fetched (5-min, per Strategy_Spec.md).
+DEFAULT_RETEST_MINUTE_BAR_LIMIT = 1500
 
 _EQUITY_BENCHMARK = "SPY"
 _CRYPTO_BENCHMARK = "BTC-USDT"
@@ -293,6 +321,7 @@ def make_enricher(
     rs_window_minutes: float = DEFAULT_RS_WINDOW_MINUTES,
     slope_lookback_bars: int = DEFAULT_SLOPE_LOOKBACK_BARS,
     retest_tolerance_pct: float = DEFAULT_RETEST_TOLERANCE_PCT,
+    retest_minute_bar_limit: int = DEFAULT_RETEST_MINUTE_BAR_LIMIT,
     equity_benchmark: str = _EQUITY_BENCHMARK,
     crypto_benchmark: str = _CRYPTO_BENCHMARK,
 ) -> EnrichmentFn:
@@ -331,8 +360,16 @@ def make_enricher(
         or_high, or_low, or_n = _opening_range(
             session, minutes=opening_range_minutes, interval_minutes=interval
         )
-        broke, held = _broke_and_held(
-            session, or_high=or_high, or_n=or_n, tolerance_pct=retest_tolerance_pct
+        broke, held = _retest_confirmation(
+            feed,
+            uc.symbol,
+            ref_time=ref_time,
+            opening_range_minutes=opening_range_minutes,
+            tolerance_pct=retest_tolerance_pct,
+            minute_bar_limit=retest_minute_bar_limit,
+            fallback_session=session,
+            fallback_or_high=or_high,
+            fallback_or_n=or_n,
         )
 
         prior_close = _prior_close(feed, uc.symbol, ref_time=ref_time)
@@ -390,6 +427,63 @@ def _prior_close(feed: FeedProtocol, symbol: str, *, ref_time) -> float:
         )
     prior.sort(key=lambda b: b.time)
     return prior[-1].close
+
+
+def _retest_confirmation(
+    feed: FeedProtocol,
+    symbol: str,
+    *,
+    ref_time,
+    opening_range_minutes: float,
+    tolerance_pct: float,
+    minute_bar_limit: int,
+    fallback_session: Sequence[Bar],
+    fallback_or_high: float,
+    fallback_or_n: int,
+) -> tuple[bool, bool]:
+    """(broke_opening_range_high, held_on_retest), read off 1-minute bars
+    when they're available.
+
+    A genuine "dip into the retest zone, then hold" can happen entirely
+    *within* a single 5-min candle -- the 5-min bar's own high/low/close
+    can't tell that apart from a candle that never actually retested, or
+    one that retested and failed, because all three collapse to the same
+    OHLC. `_broke_and_held`'s 5-min read (`fallback_*` here) is therefore
+    a proxy, not the real pattern -- flagged as such since it was written
+    (see module docstring). 1-minute bars resolve that ambiguity directly
+    at the same resolution the Entry rule itself describes ("limit order
+    at the retest of the breakout level" -- Strategy_Spec.md Sec4) without
+    changing what's being measured or its 0/1/2 weight in R5.
+
+    Falls back to the 5-min proxy the caller already computed when 1-min
+    data isn't available for this symbol (empty result, or the feed
+    raises `DataFeedError`) -- this is a precision upgrade to one existing
+    field, not a new hard data requirement, so its absence degrades to
+    prior behavior instead of aborting the whole enrichment (contrast
+    with `_prior_close`/`_relative_strength_pct`, which raise
+    `EnrichmentError` because there's no reasonable fallback for
+    genuinely missing data).
+    """
+    try:
+        minute_bars = feed.get_bars(symbol, "1m", end=ref_time, limit=minute_bar_limit)
+    except DataFeedError:
+        minute_bars = []
+
+    if not minute_bars:
+        return _broke_and_held(
+            fallback_session,
+            or_high=fallback_or_high,
+            or_n=fallback_or_n,
+            tolerance_pct=tolerance_pct,
+        )
+
+    minute_session = _session_bars(minute_bars)
+    or_high, _, or_n = _opening_range(
+        minute_session, minutes=opening_range_minutes, interval_minutes=1.0
+    )
+    return _broke_and_held(
+        minute_session, or_high=or_high, or_n=or_n, tolerance_pct=tolerance_pct
+    )
 
 
 def _relative_strength_pct(

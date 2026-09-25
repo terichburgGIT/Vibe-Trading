@@ -110,6 +110,7 @@ from vt.gate.calendar import GateState
 from vt.indicators.engine import IndicatorFrame, compute as compute_indicators
 from vt.journal import store as journal_store
 from vt.risk.gate import (
+    MAX_CONCURRENT_POSITIONS,
     BreakerState,
     Decision,
     Signal,
@@ -296,6 +297,14 @@ class PipelineRequest:
     max_quote_age_seconds: float = 5.0
     """Passed straight through to the M006 `quote_age_seconds` gate
     input. `Risk_Policy.md`'s 5s ceiling is the default."""
+
+    max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS
+    """Passed straight through to M006's step-5 concurrent-position cap.
+    Defaults to Risk_Policy.md Sec1 (equities' correlation reasoning).
+    A caller running a single-venue crypto pass can override this --
+    the cap is evaluated against `open_positions`, which in a
+    single-venue request is that venue's own count, so this only
+    changes the cap for the venue(s) actually in `adapters`."""
 
     journal_path: Path | None = None
     """Where to append Trade Cards. `None` uses M008's default at
@@ -502,6 +511,7 @@ def run_once(request: PipelineRequest) -> PipelineOutcome:
             equity=request.equity,
             breaker_state=request.breaker_state,
             now=request.now,
+            max_concurrent_positions=request.max_concurrent_positions,
         )
 
         card_id: str | None = None

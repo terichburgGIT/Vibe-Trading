@@ -41,11 +41,20 @@ from datetime import datetime, timezone
 import vt.data.feed as feed_module
 from vt.exec.adapter import BrokerExecAdapter, InternalPosition
 from vt.pipeline import PipelineRequest, PipelineOutcome, build_gate_state, make_enricher, run_once
-from vt.risk.gate import BreakerState
+from vt.risk.gate import MAX_CONCURRENT_POSITIONS, BreakerState
 
 _DEFAULT_SYMBOLS = {
     "okx": ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
     "alpaca": ["AAPL", "MSFT", "NVDA", "AMD", "TSLA"],
+}
+
+# Risk_Policy.md Sec1's concurrent-position cap (3) is sized for equities'
+# intraday correlation reasoning. Crypto has its own separate correlation
+# control (the 1-non-BTC-alt-at-a-time rule, enforced elsewhere) rather
+# than needing the same tight concurrent-position ceiling, so the OKX leg
+# runs with a wider cap. Equities keeps the Risk_Policy.md default.
+_MAX_CONCURRENT_POSITIONS = {
+    "okx": 8,
 }
 
 
@@ -112,6 +121,7 @@ def run(venue: str, symbols: list[str]) -> PipelineOutcome:
         enrich=enrich,
         internal_positions=internal_positions,
         dry_run=True,
+        max_concurrent_positions=_MAX_CONCURRENT_POSITIONS.get(venue, MAX_CONCURRENT_POSITIONS),
     )
 
     print("\n" + "=" * 70)

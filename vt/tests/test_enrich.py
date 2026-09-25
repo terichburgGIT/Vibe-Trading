@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from vt.data.feed import Bar, Quote
+from vt.data.feed import Bar, DataFeedError, Quote
 from vt.exec.adapter import Position
 from vt.gate.calendar import GateState
 from vt.indicators import engine
@@ -454,10 +454,11 @@ def test_enricher_raises_when_benchmark_series_empty() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_enricher_reports_break_and_hold_structure() -> None:
-    """A session that opens in a tight range, breaks the OR high, and holds
-    a retest must surface broke=True, held=True with an OR high/low taken
-    from the first 15 min."""
+def _break_and_hold_5m_bars() -> tuple[list[Bar], float]:
+    """5-min bars whose own OHLC shows a break-and-hold directly (i.e. the
+    5-min bar-level proxy can detect it without any 1-min data) -- shared
+    by the "no 1m data available" test and the "1m feed errors" test,
+    which should both land on the same proxy answer."""
     # First 3 bars: tight range 99.9-100.1 (OR high ~100.2 given the +0.1
     # straddle). Then a breakout and a holding retest.
     or_closes = [100.0, 100.0, 100.0]
@@ -473,7 +474,17 @@ def test_enricher_reports_break_and_hold_structure() -> None:
     # Pad with more rising bars so indicators warm up (append after the setup).
     tail = _five_min_series([or_high + 0.5 + i * 0.2 for i in range(40)],
                             start=DAY + timedelta(minutes=25))
-    bars = bars + tail
+    return bars + tail, or_high
+
+
+def test_enricher_reports_break_and_hold_structure() -> None:
+    """A session that opens in a tight range, breaks the OR high, and holds
+    a retest must surface broke=True, held=True with an OR high/low taken
+    from the first 15 min. No 1-minute bars are registered on the feed, so
+    this also exercises the fallback-to-5m-proxy path in
+    `_retest_confirmation` (the common case until every venue's 1m data is
+    confirmed reachable)."""
+    bars, or_high = _break_and_hold_5m_bars()
     frame = engine.compute(bars)
 
     feed = FakeFeed(
@@ -491,6 +502,106 @@ def test_enricher_reports_break_and_hold_structure() -> None:
     # And the rubric reads that as R5=2 (price is well above prior close 98).
     score = rubric.score(_rubric_candidate_from(e))
     assert score.breakdown["R5"] == 2
+
+
+class _RaisingMinuteFeed(FakeFeed):
+    """A feed that can serve everything except 1-minute bars (simulates a
+    venue/outage that doesn't support 1m data)."""
+
+    def get_bars(self, symbol, timeframe="1d", *, start=None, end=None, limit=90):
+        if timeframe == "1m":
+            raise DataFeedError("simulated 1m outage")
+        return super().get_bars(symbol, timeframe, start=start, end=end, limit=limit)
+
+
+def test_enricher_falls_back_to_5m_proxy_when_1m_feed_errors() -> None:
+    """Retest confirmation is a precision upgrade to one existing field,
+    not a hard data requirement (see `_retest_confirmation`'s docstring)
+    -- a `DataFeedError` fetching 1-minute bars must degrade to the 5-min
+    proxy, not abort the whole enrichment."""
+    bars, or_high = _break_and_hold_5m_bars()
+    frame = engine.compute(bars)
+
+    feed = _RaisingMinuteFeed(
+        bars_by_key={
+            ("AAPL", "1d"): [_bar(DAY - timedelta(days=1), open_=98, high=99, low=97, close=98.0)],
+            ("SPY", "5m"): _five_min_series([400.0] * 10, symbol="SPY"),
+        },
+        quote_by_symbol={"AAPL": _quote(last=bars[-1].close)},
+    )
+    e = make_enricher(feed)(_uc(), bars, frame, feed.get_quote("AAPL"))
+
+    assert e.opening_range_high == pytest.approx(or_high)
+    assert e.broke_opening_range_high is True
+    assert e.held_on_retest is True  # from the 5-min proxy fallback
+
+
+def test_enricher_uses_1m_bars_to_catch_a_retest_the_5m_proxy_misses() -> None:
+    """The exact gap AD016/S031 closes: a retest-and-hold that happens
+    entirely inside the breakout's own 5-min candle is invisible to the
+    5-min proxy (`_broke_and_held` skips the retest check on the same bar
+    where the breakout is first seen -- see that function's docstring),
+    but the real 1-minute bars show a genuine momentary hold at minute 16
+    before price fades. This proves 1-minute data changes the answer, not
+    just that it runs without error.
+    """
+    # Opening range: 15 flat one-minute bars, or_high ~= 100.1.
+    minute_bars = [
+        _bar(DAY + timedelta(minutes=i), open_=100.0, high=100.1, low=99.9, close=100.0)
+        for i in range(15)
+    ]
+    # Breakout (m15), a momentary retest-and-hold (m16), then a fade that
+    # never reclaims the level (m17-19) -- all inside one 5-min bucket.
+    minute_bars += [
+        _bar(DAY + timedelta(minutes=15), open_=100.0, high=102.0, low=101.9, close=101.95),
+        _bar(DAY + timedelta(minutes=16), open_=101.95, high=101.95, low=100.05, close=100.12),
+        _bar(DAY + timedelta(minutes=17), open_=100.12, high=100.12, low=99.5, close=99.6),
+        _bar(DAY + timedelta(minutes=18), open_=99.6, high=99.65, low=99.4, close=99.5),
+        _bar(DAY + timedelta(minutes=19), open_=99.5, high=99.55, low=99.3, close=99.4),
+    ]
+    # Next bucket: continues fading, never comes back near the level.
+    minute_bars += [
+        _bar(DAY + timedelta(minutes=20), open_=99.4, high=99.5, low=99.2, close=99.3),
+        _bar(DAY + timedelta(minutes=21), open_=99.3, high=99.4, low=99.1, close=99.2),
+        _bar(DAY + timedelta(minutes=22), open_=99.2, high=99.3, low=99.0, close=99.1),
+        _bar(DAY + timedelta(minutes=23), open_=99.1, high=99.2, low=98.9, close=99.0),
+        _bar(DAY + timedelta(minutes=24), open_=99.0, high=99.1, low=98.8, close=98.9),
+    ]
+
+    # The 5-min bars are a real OHLC roll-up of those same minutes (open
+    # = first, high = max, low = min, close = last) -- not a fabricated
+    # mismatch -- plus a declining tail (never re-crosses or_high, so it
+    # can't accidentally trip the proxy) long enough for indicators to warm up.
+    or_5m = _five_min_series([100.0, 100.0, 100.0])
+    bucket_4 = _bar(DAY + timedelta(minutes=15), open_=100.0, high=102.0, low=99.3, close=99.4)
+    bucket_5 = _bar(DAY + timedelta(minutes=20), open_=99.4, high=99.5, low=98.8, close=98.9)
+    tail = _five_min_series([98.9 - i * 0.2 for i in range(40)],
+                            start=DAY + timedelta(minutes=25))
+    bars = or_5m + [bucket_4, bucket_5] + tail
+    frame = engine.compute(bars)
+
+    feed = FakeFeed(
+        bars_by_key={
+            ("AAPL", "1d"): [_bar(DAY - timedelta(days=1), open_=98, high=99, low=97, close=98.0)],
+            ("SPY", "5m"): _five_min_series([400.0] * 10, symbol="SPY"),
+            ("AAPL", "1m"): minute_bars,
+        },
+        quote_by_symbol={"AAPL": _quote(last=bars[-1].close)},
+    )
+
+    # Sanity check: the 5-min-only read genuinely misses this hold, so the
+    # test is demonstrating a real gap, not a coincidence.
+    session_5m = _session_bars(bars)
+    or_high_5m, _, or_n_5m = _opening_range(session_5m, minutes=15.0, interval_minutes=5.0)
+    _, held_5m_only = _broke_and_held(
+        session_5m, or_high=or_high_5m, or_n=or_n_5m, tolerance_pct=0.001
+    )
+    assert held_5m_only is False
+
+    e = make_enricher(feed)(_uc(), bars, frame, feed.get_quote("AAPL"))
+
+    assert e.broke_opening_range_high is True
+    assert e.held_on_retest is True  # only visible at 1-minute resolution
 
 
 def _rubric_candidate_from(e: runner.Enrichment, symbol="AAPL", venue="alpaca") -> rubric.Candidate:
